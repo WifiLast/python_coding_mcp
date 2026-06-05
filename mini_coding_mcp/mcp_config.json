@@ -1,0 +1,34 @@
+{
+    "mcpServers": {
+        "codesys": {
+            "command": "C:\\Users\\wiffzack\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+            "args": [
+                "c:/Users/wiffzack/Documents/GIT/codesys_mcp/codesys_service/server.py"
+            ],
+            "env": {
+                "CODESYS_PATH": "C:\\Program Files\\CODESYS 3.5.21.50\\CODESYS\\Common\\CODESYS.exe",
+                "CODESYS_PROFILE": "CODESYS V3.5 SP21 Patch 5"
+            }
+        },
+        "codeplan": {
+            "command": "python",
+            "args": [
+                "C:/Users/wiffzack/Documents/GIT/mcp_module_builder/src/mcp_code_control/server.py",
+                "--root",
+                "C:/Users/wiffzack/Documents/GIT/mcp_module_builder",
+                "--transport",
+                "stdio"
+            ],
+            "disabled": false
+        },
+        "mini_coding_mcp": {
+            "command": "C:\\Users\\wiffzack\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+            "args": [
+                "C:/Users/wiffzack/Documents/GIT/mcp_module_builder/mini_coding_mcp/server.py",
+                "--root",
+                "C:/Users/wiffzack/Documents/GIT/mcp_module_builder"
+            ],
+            "disabled": false
+        }
+    }
+}

@@ -1,0 +1,9 @@
+{
+    "analysis_rules": {
+        "max_for_loops": 8,
+        "max_if_statements": 15,
+        "max_lines_per_function": 100,
+        "repetition_window": 3,
+        "repetition_threshold": 2
+    }
+}

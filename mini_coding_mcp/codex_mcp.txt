@@ -1,0 +1,74 @@
+model = "gpt-5.4-mini"
+model_reasoning_effort = "medium"
+[model_providers.lmstudio_local]
+name = "LM Studio Local"
+base_url = "http://192.168.137.45:2345/v1"
+wire_api = "responses"
+
+[profiles.lms]
+model_provider = "lmstudio_local"
+model = "unsloth/qwen3.5-9b"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/stock_check"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/local_llm_mcp"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/meshopt_importer"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/memory_manager"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/blender_split_symmetric"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/fft_image_signature_v1"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/fake_hdr"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/Z3_WEBVISU"]
+trust_level = "trusted"
+
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/codesys_mcp"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/llm_web_collector"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/blender2ue_rig_exporter"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/lora_train"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/blender_magic_wand"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/blender_body_tracking"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/SlimeVR-Server"]
+trust_level = "trusted"
+
+[projects."/mnt/c/Users/wiffzack/Documents/GIT/mcp_module_builder"]
+trust_level = "trusted"
+
+[mcps."mini_coding_mcp"]
+description = "MCP server for code insertion, symbol indexing, and module scaffolding with dynamic workspace root switching"
+command = "python"
+args = ["C:\\Users\\wiffzack\\Documents\\GIT\\mcp_module_builder\\mini_coding_mcp\\server.py", "--root", "."]
+enabled = true
+
+[notice]
+fast_default_opt_out = true
+
+[notice.model_migrations]
+"gpt-5.3-codex" = "gpt-5.4"
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
