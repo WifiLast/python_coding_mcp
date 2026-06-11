@@ -16,7 +16,7 @@ _PHASE_NEXT_TOOL: dict[str, str | None] = {
     "none":      None,
     "plan":      "plan_module_structure",
     "scaffold":  "scaffold_module",
-    "implement": "insert_code",
+    "implement": "replace_symbol",
     "test":      "insert_code",
     "quality":   "lint",
     "done":      "finalize_file_names",
@@ -63,7 +63,7 @@ class WorkflowTracker:
         for name in file_names:
             fresh[name] = existing.get(name, _blank_file_state())
         self._s["files"] = fresh
-        self._s["tests"] = {}
+        self._s["tests"] = self._s.get("tests", {})
 
     def on_scaffold(self, file_name: str) -> None:
         _file(self._s, file_name)["scaffolded"] = True

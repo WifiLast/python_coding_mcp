@@ -107,6 +107,31 @@ class FunctionScanner(ast.NodeVisitor):
         self.stack.pop()
 
 
+def _reason_suggestion(reason: str) -> str:
+    if reason.startswith("if_statements>"):
+        return "Extract branches into named predicates or helper functions."
+    if reason.startswith("nesting_depth>"):
+        return "Flatten control flow with early returns or helper functions."
+    if reason.startswith("for_loops>"):
+        return "Break loop bodies into helpers and separate independent passes."
+    if reason.startswith("lines>"):
+        return "Split the function into smaller units with single-purpose responsibilities."
+    if reason == "repeated_sequences":
+        return "Extract repeated statement blocks into a shared helper."
+    return "Refactor this function into smaller, clearer units."
+
+
+def _suggestions_for_reasons(reasons: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        suggestion = _reason_suggestion(reason)
+        if suggestion not in seen:
+            ordered.append(suggestion)
+            seen.add(suggestion)
+    return ordered
+
+
 class ComplexityCounter(ast.NodeVisitor):
     def __init__(self) -> None:
         self.for_loops = 0
@@ -392,7 +417,7 @@ def analyze_workspace(root: Path, config_path: Path | None = None, files: list[P
                         "max_nesting_depth": analysis.max_nesting_depth,
                         "repeated_sequences": analysis.repeated_sequences,
                         "reasons": analysis.reasons,
-                        "suggestion": "Split this function into smaller functions that isolate repeated logic and nested branching.",
+                        "suggestions": _suggestions_for_reasons(analysis.reasons),
                     }
                 )
 

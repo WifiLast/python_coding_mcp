@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import difflib
 import logging
 import json
 import os
@@ -57,6 +58,21 @@ from .manipulator import (
 from .app import create_app, main  # noqa: F401
 
 __all__ = ["MiniWorkspace", "create_app", "main"]
+
+_PLAN_FILE = ".mcp_plan.json"
+
+
+def _load_plan_payload(root: Path) -> dict[str, Any]:
+    plan_path = root / _PLAN_FILE
+    if not plan_path.exists():
+        return {}
+    try:
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): value for key, value in payload.items() if isinstance(key, str)}
 
 
 class MiniWorkspace:
@@ -474,6 +490,46 @@ class MiniWorkspace:
                 results.append(sym)
         return results
 
+    def _did_you_mean_symbols(self, qname: str, limit: int = 3) -> list[str]:
+        candidates = sorted(self.symbol_index.symbols)
+        if not candidates:
+            return []
+        return difflib.get_close_matches(qname, candidates, n=limit, cutoff=0.0)
+
+    def _qname_format_hint(self, qname: str, limit: int = 3) -> dict[str, Any] | None:
+        if ":" in qname or "." not in qname:
+            return None
+        leaf = qname.split(".")[-1]
+        search_matches = self.search(query=leaf).get("matches", [])
+        candidates: list[str] = []
+        for match in search_matches:
+            if not isinstance(match, dict):
+                continue
+            candidate = match.get("qname")
+            if isinstance(candidate, str) and candidate not in candidates:
+                candidates.append(candidate)
+            if len(candidates) >= limit:
+                break
+        if not candidates:
+            candidates = self._did_you_mean_symbols(qname, limit=limit)
+        return {
+            "found": False,
+            "reason": "invalid_qname_format",
+            "qname": qname,
+            "hint": "Use ':' between the module name and the qualified name, e.g. pkg.mod:Class.method.",
+            "search_query": leaf,
+            "did_you_mean": candidates,
+            "error_detail": {
+                "code": "invalid_qname_format",
+                "message": "Qualified names must use ':' between module and symbol, not '.'.",
+                "detail": {
+                    "qname": qname,
+                    "search_query": leaf,
+                    "did_you_mean": candidates,
+                },
+            },
+        }
+
     def _find_symbol_details(
         self,
         name: str,
@@ -828,7 +884,7 @@ class MiniWorkspace:
             "count": len(entries),
         }
 
-    def insert_code(self, destination_file: str | Path, code: str, anchor: str | None = None, position: str = "auto") -> dict[str, Any]:
+    def insert_code(self, destination_file: str | Path, code: str, anchor: str | None = None, position: str = "auto", skip_diagnostics: bool = False) -> dict[str, Any]:
         with self._lock:
             path = self._resolve_path(destination_file)
             # Only ensure the target file is indexed — avoid a full workspace
@@ -884,7 +940,8 @@ class MiniWorkspace:
             if not edited_qnames:
                 edited_qnames = [self.symbol_index._module_qname(path)]
             before = self.diagnostic_store.snapshot()
-            self.diagnostic_store.refresh([path])
+            if not skip_diagnostics:
+                self.diagnostic_store.refresh([path])
             delta = self.diagnostic_store.delta(before)
             edited_symbols = [self.symbol_index.resolve(qname) for qname in edited_qnames if qname in self.symbol_index.symbols]
             self._log_action("insert", edited_symbols, delta)
@@ -910,10 +967,10 @@ class MiniWorkspace:
             }
 
     def index_file(self, path: str | Path, verbose: bool = False) -> list[dict[str, Any]]:
-        self._ensure_symbol_index()
         resolved = self._resolve_path(path)
         if resolved.suffix.lower() not in supported_extensions():
             return []
+        self.symbol_index.ensure_file_scanned(resolved)
         return [self._public_index_entry(entry, verbose=verbose) for entry in self._index_source_file(resolved)]
 
     def get_symbol_calls(self, name: str, path: str | Path | None = None, qualname: str | None = None, verbose: bool = False) -> dict[str, Any]:
@@ -1024,7 +1081,7 @@ class MiniWorkspace:
         if qname in self.symbol_index.symbols:
             symbol = self.symbol_index.resolve(qname)
             if kind is not None and symbol.kind != kind:
-                return {"found": False, "symbol": None, "matches": []}
+                return {"found": False, "symbol": None, "matches": [], "did_you_mean": self._did_you_mean_symbols(qname, limit=3)}
             if projection == "code":
                 return {
                     "found": True,
@@ -1047,7 +1104,10 @@ class MiniWorkspace:
             return {"found": True, "symbol": self._public_symbol(symbol, verbose=verbose), "matches": [self._public_symbol(symbol, verbose=verbose)]}
         matches = self._find_symbol_details(name=qname, path=path, qualname=qname, kind=kind)
         if not matches:
-            return {"found": False, "symbol": None, "matches": []}
+            qname_hint = self._qname_format_hint(qname)
+            if qname_hint is not None:
+                return qname_hint
+            return {"found": False, "symbol": None, "matches": [], "did_you_mean": self._did_you_mean_symbols(qname, limit=3)}
         if len(matches) > 1:
             return {
                 "found": False,
@@ -1117,7 +1177,10 @@ class MiniWorkspace:
             return {"found": True, "symbol": self._public_symbol(symbol, verbose=False), "summary": summary}
         matches = self._find_symbol_details(name=qname, path=path, qualname=qname, kind=kind)
         if not matches:
-            return {"found": False, "symbol": None, "summary": None}
+            qname_hint = self._qname_format_hint(qname)
+            if qname_hint is not None:
+                return qname_hint
+            return {"found": False, "symbol": None, "summary": None, "did_you_mean": self._did_you_mean_symbols(qname, limit=3)}
         if len(matches) > 1:
             return {
                 "found": False,
@@ -1879,7 +1942,20 @@ class MiniWorkspace:
         _walk(qname)
         return {"found": True, "qname": qname, "chain": list(reversed(chain))}
 
-    def dead_symbols(self, files: list[str] | None = None, roots: list[str] | None = None) -> dict[str, Any]:
+    def _dead_symbol_confidence(self, detail: SymbolDetail) -> str:
+        if detail.name.startswith("visit_") or detail.name.startswith("__"):
+            return "low"
+        if any(decorator == "property" or decorator.endswith(".property") for decorator in detail.decorators):
+            return "low"
+        return "high"
+
+    def dead_symbols(
+        self,
+        files: list[str] | None = None,
+        roots: list[str] | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
         target_files = self._iter_workspace_source_files()
         if files is not None or roots is not None:
             target_files = self._scope_source_files(files=files, roots=roots)
@@ -1907,9 +1983,21 @@ class MiniWorkspace:
                         "qualname": detail.qualname,
                         "line_start": detail.start_line,
                         "line_end": detail.end_line,
+                        "confidence": self._dead_symbol_confidence(detail),
                     }
                 )
-        return {"count": len(dead), "matches": dead}
+        dead.sort(key=lambda item: (item["file_path"], item["line_start"], item["qname"]))
+        total = len(dead)
+        safe_offset = max(offset, 0)
+        page = dead[safe_offset:] if limit is None else dead[safe_offset : safe_offset + max(limit, 0)]
+        return {
+            "count": total,
+            "returned": len(page),
+            "offset": safe_offset,
+            "limit": limit,
+            "truncated": safe_offset + len(page) < total,
+            "matches": page,
+        }
 
     def patch_symbol(
         self,
@@ -2331,6 +2419,9 @@ class MiniWorkspace:
         # Slow fallback: re-parse workspace files (only reached when symbol is absent from index).
         matches = self._find_symbol_details(name=qname, path=path, qualname=qname)
         if not matches:
+            qname_hint = self._qname_format_hint(qname)
+            if qname_hint is not None:
+                return qname_hint
             return {"accepted": False, "reason": "not_found", "matches": []}
         if len(matches) > 1:
             return {
@@ -2472,6 +2563,52 @@ class MiniWorkspace:
             target_path = target_path / "main.py"
         existing = self._read_text(target_path)
         names = names or []
+
+        plan_payload = _load_plan_payload(self.root)
+        plan_entry = plan_payload.get(target_path.name) if isinstance(plan_payload, dict) else None
+        if isinstance(plan_entry, dict) and "depends_on" in plan_entry:
+            local_candidate_name: str | None = None
+            module_path = Path(module.replace(".", "/"))
+            search_candidates = [
+                self.root / module_path.with_suffix(".py"),
+                self.root / module_path / "__init__.py",
+                target_path.parent / f"{module.split('.')[-1]}.py",
+                target_path.parent / module.split(".")[-1] / "__init__.py",
+            ]
+            for candidate in search_candidates:
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                try:
+                    resolved.relative_to(self.root)
+                except ValueError:
+                    continue
+                if resolved.exists() and resolved.is_file() or resolved.name in plan_payload:
+                    local_candidate_name = resolved.name
+                    break
+
+            if local_candidate_name is not None:
+                allowed = {
+                    str(dep)
+                    for dep in plan_entry.get("depends_on", [])
+                    if isinstance(dep, str)
+                }
+                if local_candidate_name not in allowed:
+                    return {
+                        "accepted": False,
+                        "ok": False,
+                        "reason": "dependency_not_allowed",
+                        "hint": (
+                            f"{target_path.name} may only import from: "
+                            f"{', '.join(sorted(allowed)) if allowed else '[nothing]'}"
+                        ),
+                        "file": str(target_path),
+                        "import": module,
+                        "resolved_dependency": local_candidate_name,
+                        "allowed_dependencies": sorted(allowed),
+                    }
+
         tree = self._parse_python(existing)
         if tree is not None:
             for node in tree.body:
@@ -2678,6 +2815,92 @@ class MiniWorkspace:
             cmds.append(["git", "apply", "--whitespace=fix", str(patch_path)])
         return cmds
 
+    def _apply_begin_patch_format(self, patch_text: str) -> dict[str, Any]:
+        """Handle the *** Begin Patch / *** Add File / *** Delete File custom format."""
+        changed_files: list[Path] = []
+        errors: list[str] = []
+
+        lines = patch_text.splitlines()
+        i = 0
+        # skip to first directive
+        while i < len(lines) and not lines[i].startswith("*** "):
+            i += 1
+
+        current_op: str | None = None
+        current_path: Path | None = None
+        content_lines: list[str] = []
+
+        def _flush() -> None:
+            if current_op in ("Add File", "Update File") and current_path is not None:
+                if current_op == "Update File" and current_path.exists():
+                    original_lines = current_path.read_text(encoding="utf-8").splitlines()
+                    if len(content_lines) > 20 and len(original_lines) > 0 and len(content_lines) >= len(original_lines) * 0.8:
+                        errors.append(
+                            f"apply_patch rejected for {current_path.name}: *** Update File supplies "
+                            f"{len(content_lines)} lines ({len(original_lines)} original) — this is a "
+                            "near-full file rewrite, not a patch. Use replace_symbol to replace a specific "
+                            "function or class, or patch_symbol for a sub-range edit."
+                        )
+                        return
+                current_path.parent.mkdir(parents=True, exist_ok=True)
+                current_path.write_text("\n".join(content_lines) + ("\n" if content_lines else ""), encoding="utf-8")
+                changed_files.append(current_path)
+
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith("*** End Patch"):
+                _flush()
+                break
+            if line.startswith("*** Delete File:"):
+                _flush()
+                rel = line[len("*** Delete File:"):].strip()
+                target = (self.root / rel).resolve()
+                if target.exists():
+                    target.unlink()
+                    changed_files.append(target)
+                current_op = None
+                current_path = None
+                content_lines = []
+            elif line.startswith("*** Add File:") or line.startswith("*** Update File:"):
+                _flush()
+                prefix = "*** Add File:" if line.startswith("*** Add File:") else "*** Update File:"
+                current_op = prefix[4:-1]
+                rel = line[len(prefix):].strip()
+                current_path = (self.root / rel).resolve()
+                content_lines = []
+            elif current_op in ("Add File", "Update File"):
+                if line.startswith("+ "):
+                    content_lines.append(line[2:])
+                elif line.startswith("+"):
+                    content_lines.append(line[1:])
+                elif line.startswith("  ") or line.startswith(" "):
+                    content_lines.append(line[1:])
+            i += 1
+
+        if not changed_files and errors:
+            return {"accepted": False, "reason": "begin_patch_errors", "errors": errors}
+        if not changed_files:
+            return {"accepted": False, "reason": "begin_patch_no_changes", "patch_format": "begin_patch"}
+
+        self._workspace_index_cache = None
+        self._file_index_cache.clear()
+        for path in changed_files:
+            if path.exists():
+                self.symbol_index.reindex_file(path)
+            else:
+                resolved = path.resolve()
+                for qname in list(self.symbol_index.by_file.get(resolved, [])):
+                    self.symbol_index.symbols.pop(qname, None)
+                self.symbol_index.by_file.pop(resolved, None)
+        self.diagnostic_store.refresh([p for p in changed_files if p.exists()])
+        return {
+            "accepted": True,
+            "returncode": 0,
+            "stdout": f"Applied begin-patch format: {len(changed_files)} file(s) changed.",
+            "stderr": "",
+            "changed_files": [str(p) for p in changed_files],
+        }
+
     def apply_patch(self, patch_text: str) -> dict[str, Any]:
         patch_path = self.root / ".mini_coding_mcp.patch"
         patch_path.write_text(patch_text, encoding="utf-8")
@@ -2707,6 +2930,9 @@ class MiniWorkspace:
             self.symbol_index.scan()
             self.diagnostic_store.refresh(self.symbol_index.by_file.keys())
             return {"accepted": True, "stdout": stdout, "stderr": stderr}
+
+        if patch_text.lstrip().startswith("*** Begin Patch"):
+            return self._apply_begin_patch_format(patch_text)
 
         return self._apply_unified_diff(patch_text)
 

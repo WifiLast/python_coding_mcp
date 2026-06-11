@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -201,7 +202,6 @@ class WorkspaceIndex:
         self._scanned = True
 
     def reindex_file(self, path: Path) -> None:
-        self.ensure_scanned()
         resolved = path.resolve()
         for qname in self.by_file.get(resolved, []):
             self.symbols.pop(qname, None)

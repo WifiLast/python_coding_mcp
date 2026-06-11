@@ -40,11 +40,13 @@ Call `plan_module_structure(files)` with every file you intend to create:
 
 The server returns `naming_issues` (with `reason` and `hint` per file) and `missing_deps`.
 Fix all issues until `ok: true`. The server rejects both non-verb_noun names and known-generic stems like `train_model`, `load_data`, `run_script`.
+At the end of the plan call, the server writes `.mcp_constraints.md` in the project root. Treat it as the active plan contract: it lists the allowed import edges, placement rules, symbol inventory, operation routing, and file-specific quality gates. Read it before the next step.
 
 ### STEP 1 — Scaffold
 Call `scaffold_module(file, stubs)` for each file. The server automatically writes:
 1. A module-level docstring from the plan's `purpose` field (with import dependencies noted)
 2. Each stub as a `raise NotImplementedError` function/class with its own docstring
+3. An updated `.mcp_constraints.md` entry for the file's symbol inventory and quality gates
 
 The file will be unscaffoldable (`ok: false`) if `plan_module_structure` was not called first.
 Include every foreseeable helper even if not requested yet.
@@ -85,6 +87,7 @@ After every `insert_code` call, check `missing_docstrings` in the response. If i
 
 ## Imports
 Always use `add_import(module, names=[])`. It deduplicates. Never hand-edit import blocks.
+If the target file is part of a declared plan, `add_import` will reject any local import edge that is not listed in that file's `depends_on` whitelist.
 
 ## After every write
 Check the response:

@@ -94,6 +94,7 @@ Call `plan_module_structure` before creating any source file.
 - List every file you intend to create.
 - Each entry needs: `name` (verb_noun.py), `purpose` (one sentence), `depends_on` (other files in this plan that it imports from).
 - Do **not** create any file until `naming_issues` and `missing_deps` are both empty in the response.
+The plan call also writes `.mcp_constraints.md` in the project root. Treat it as the active contract for the run: it makes the allowed import edges explicit, records file-specific quality gates, and captures the symbol inventory as scaffolding progresses. Read it before the next step.
 
 ```
 plan_module_structure(files=[
@@ -177,6 +178,7 @@ Use `insert_code` to add functions, classes, or imports.
 ### Add imports
 
 Use `add_import` for any `import` or `from … import` with automatic deduplication.
+When the file is part of the declared plan, the server rejects any local import edge that is not present in `depends_on`.
 
 ### Replace or patch existing symbols
 

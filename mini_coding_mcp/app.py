@@ -11,24 +11,81 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from .call_graph import build_call_graph, _collect_local_imports as _collect_local_imports
-from .file_suffix import (
-    apply_numeric_suffix,
-    category_names,
-    category_from_name,
-    decode_filename_suffix as _decode_filename_suffix,
-    infer_file_suffix_result,
-    flags_from_filename,
-    suffix_number,
-)
-from .lang.router import adapter_for, supported_extensions
-from .static_analysis import analyze_workspace
-from .stable_index import module_name_for_path
-from .working_set import WorkingSet
-from .workflow_tracker import WorkflowTracker
-from .tools.regex_rules import generate_regex_rule as _generate_regex_rule
+from .module_reloader import ModuleReloader as _ModuleReloader
+
+# ---------------------------------------------------------------------------
+# Sub-module loading via ModuleReloader
+# All sub-modules listed here are loaded once through the package system and
+# tracked so they can be hot-reloaded with the reload_module / reload_all_modules
+# MCP tools without restarting the server.
+# ---------------------------------------------------------------------------
+_PKG = __name__.rsplit(".", 1)[0] if "." in __name__ else __name__
+
+_reloader = _ModuleReloader()
+
+_MANAGED_SUBMODULES = [
+    f"{_PKG}.call_graph",
+    f"{_PKG}.file_suffix",
+    f"{_PKG}.lang.router",
+    f"{_PKG}.static_analysis",
+    f"{_PKG}.stable_index",
+    f"{_PKG}.working_set",
+    f"{_PKG}.workflow_tracker",
+    f"{_PKG}.tools.regex_rules",
+]
+for _mod in _MANAGED_SUBMODULES:
+    _reloader.register_module(_mod)
+
+
+def _bind_module_symbols() -> None:
+    """Rebind module-level names from the reloader after a hot-reload."""
+    global build_call_graph, _collect_local_imports
+    global apply_numeric_suffix, category_names, category_from_name
+    global _decode_filename_suffix, infer_file_suffix_result, flags_from_filename, suffix_number
+    global adapter_for, supported_extensions
+    global analyze_workspace
+    global module_name_for_path
+    global WorkingSet
+    global WorkflowTracker
+    global _generate_regex_rule
+
+    _cg = _reloader.get_module(f"{_PKG}.call_graph")
+    build_call_graph = _cg.build_call_graph
+    _collect_local_imports = _cg._collect_local_imports
+
+    _fs = _reloader.get_module(f"{_PKG}.file_suffix")
+    apply_numeric_suffix = _fs.apply_numeric_suffix
+    category_names = _fs.category_names
+    category_from_name = _fs.category_from_name
+    _decode_filename_suffix = _fs.decode_filename_suffix
+    infer_file_suffix_result = _fs.infer_file_suffix_result
+    flags_from_filename = _fs.flags_from_filename
+    suffix_number = _fs.suffix_number
+
+    _lr = _reloader.get_module(f"{_PKG}.lang.router")
+    adapter_for = _lr.adapter_for
+    supported_extensions = _lr.supported_extensions
+
+    _sa = _reloader.get_module(f"{_PKG}.static_analysis")
+    analyze_workspace = _sa.analyze_workspace
+
+    _si = _reloader.get_module(f"{_PKG}.stable_index")
+    module_name_for_path = _si.module_name_for_path
+
+    _ws = _reloader.get_module(f"{_PKG}.working_set")
+    WorkingSet = _ws.WorkingSet
+
+    _wt = _reloader.get_module(f"{_PKG}.workflow_tracker")
+    WorkflowTracker = _wt.WorkflowTracker
+
+    _rr = _reloader.get_module(f"{_PKG}.tools.regex_rules")
+    _generate_regex_rule = _rr.generate_regex_rule
+
+
+_bind_module_symbols()
 
 _PLAN_FILE = ".mcp_plan.json"
+_CONSTRAINTS_FILE = ".mcp_constraints.md"
 _DEP_TAG_MARKER = "__deps_"
 _SOURCE_EXCLUDED_DIRS = {
     ".git",
@@ -132,6 +189,213 @@ def _save_module_plan(root: Path, module_plan: dict[str, Any]) -> None:
 
 def _module_plan_file_names(module_plan: dict[str, Any]) -> list[str]:
     return [name for name in module_plan if isinstance(name, str) and not name.startswith("_")]
+
+
+def _module_plan_entries(module_plan: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        (name, value)
+        for name, value in module_plan.items()
+        if isinstance(name, str) and not name.startswith("_") and isinstance(value, dict)
+    ]
+
+
+def _dependency_whitelist(module_plan: dict[str, Any]) -> dict[str, list[str]]:
+    whitelist: dict[str, list[str]] = {}
+    for name, info in _module_plan_entries(module_plan):
+        deps = [str(dep) for dep in info.get("depends_on", []) if isinstance(dep, str)]
+        whitelist[name] = sorted(dict.fromkeys(deps))
+    return whitelist
+
+
+def _constraints_quality_checks(module_plan: dict[str, Any]) -> dict[str, list[str]]:
+    checks: dict[str, list[str]] = {}
+    whitelist = _dependency_whitelist(module_plan)
+    inbound: dict[str, int] = {name: 0 for name in whitelist}
+    outbound: dict[str, int] = {name: len(deps) for name, deps in whitelist.items()}
+    for name, deps in whitelist.items():
+        for dep in deps:
+            if dep in inbound:
+                inbound[dep] += 1
+
+    for name in whitelist:
+        is_entry_point = inbound.get(name, 0) == 0 and outbound.get(name, 0) > 0
+        is_leaf = outbound.get(name, 0) == 0
+        if is_entry_point:
+            checks[name] = ["lint", "dead_symbols", "exception_surface"]
+        elif is_leaf:
+            checks[name] = ["lint", "missing_annotations", "analyze_static_code"]
+        else:
+            checks[name] = ["lint"]
+    return checks
+
+
+def _find_dependency_cycles(module_plan: dict[str, Any]) -> list[list[str]]:
+    adjacency = {
+        name: [dep for dep in info.get("depends_on", []) if isinstance(dep, str)]
+        for name, info in _module_plan_entries(module_plan)
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    stack: list[str] = []
+    cycles: list[list[str]] = []
+    seen_cycles: set[tuple[str, ...]] = set()
+
+    def _canonical_cycle(cycle: list[str]) -> tuple[str, ...]:
+        ring = cycle[:-1]
+        if not ring:
+            return tuple(cycle)
+        rotations = [tuple(ring[index:] + ring[:index] + [ring[index]]) for index in range(len(ring))]
+        return min(rotations)
+
+    def _dfs(node: str) -> None:
+        visiting.add(node)
+        stack.append(node)
+        for dep in adjacency.get(node, []):
+            if dep in visiting:
+                start = stack.index(dep)
+                cycle = stack[start:] + [dep]
+                key = _canonical_cycle(cycle)
+                if key not in seen_cycles:
+                    seen_cycles.add(key)
+                    cycles.append(cycle)
+                continue
+            if dep not in visited:
+                _dfs(dep)
+        stack.pop()
+        visiting.remove(node)
+        visited.add(node)
+
+    for name in adjacency:
+        if name not in visited:
+            _dfs(name)
+    return cycles
+
+
+def _render_constraints_document(module_plan: dict[str, Any], workspace_root: Path) -> str:
+    entries = _module_plan_entries(module_plan)
+    whitelist = _dependency_whitelist(module_plan)
+    quality_checks = _constraints_quality_checks(module_plan)
+    validation = module_plan.get("_plan_validation", {})
+    if not isinstance(validation, dict):
+        validation = {}
+    inbound: dict[str, int] = {name: 0 for name, _ in entries}
+    outbound: dict[str, int] = {name: len(whitelist.get(name, [])) for name, _ in entries}
+    for name, deps in whitelist.items():
+        for dep in deps:
+            if dep in inbound:
+                inbound[dep] += 1
+
+    dependency_cycles = validation.get("dependency_cycles")
+    if not isinstance(dependency_cycles, list):
+        dependency_cycles = _find_dependency_cycles(module_plan)
+    naming_issues = validation.get("naming_issues") if isinstance(validation.get("naming_issues"), list) else []
+    missing_deps = validation.get("missing_deps") if isinstance(validation.get("missing_deps"), list) else []
+    plan_ok = bool(validation.get("ok", not naming_issues and not missing_deps and not dependency_cycles))
+
+    lines: list[str] = [
+        "# Plan Constraints",
+        "",
+        "*Auto-generated from `.mcp_plan.json` - do not edit manually.*",
+        "",
+        "## Scope",
+        f"- Workspace root: `{workspace_root}`",
+        f"- Plan status: `{'ok' if plan_ok else 'blocked'}`",
+        f"- Planned files: `{len(entries)}`",
+        "",
+        "## Topology Constraints",
+        "",
+        "The allowed import edges are an explicit whitelist derived from `depends_on`.",
+        "",
+    ]
+    for name, info in entries:
+        deps = whitelist.get(name, [])
+        rendered_deps = "[nothing]" if not deps else "[" + ", ".join(f"`{dep}`" for dep in deps) + "]"
+        lines.append(f"- `{name}` may import from: {rendered_deps}")
+    lines.extend([
+        "",
+        "## Placement Rules",
+        "",
+        "- Source files -> `src/{slug}/`",
+        "- Test files -> `tests/`",
+        "- Config and boilerplate -> project root",
+        "- `.md` files -> only via `generate_description()`; never hand-written",
+        "",
+        "## Symbol Inventory",
+        "",
+    ])
+    for name, info in entries:
+        symbols = info.get("symbols", [])
+        if not symbols:
+            lines.append(f"- `{name}`: `pending scaffold`")
+            continue
+        rendered_symbols: list[str] = []
+        for symbol in symbols:
+            if not isinstance(symbol, dict):
+                continue
+            symbol_name = str(symbol.get("name", "")).strip()
+            kind = str(symbol.get("kind", "function")).strip()
+            if symbol_name:
+                rendered_symbols.append(f"{symbol_name} ({kind})")
+        if rendered_symbols:
+            lines.append(f"- `{name}` must contain: {', '.join(f'`{item}`' for item in rendered_symbols)}")
+        else:
+            lines.append(f"- `{name}`: `pending scaffold`")
+    lines.extend([
+        "",
+        "## Operation Routing",
+        "",
+        "| Action | Required tool | Forbidden alternatives |",
+        "|---|---|---|",
+        "| Read a symbol's body | `get_symbol(detail='code')` | Reading the file directly |",
+        "| Add an import | `add_import` | `insert_code` with import string |",
+        "| Replace a function | `replace_symbol` | `patch_symbol` with full body, `insert_code` |",
+        "| Rename anything | `rename_symbol` / `rename_file` | `replace_symbol` + manual find |",
+        "| Create a file | `scaffold_module` then `replace_symbol` | `insert_code` on non-existent file |",
+        "| Write docs | `generate_description` | Manual `.md` creation |",
+        "",
+        "## Step Gates",
+        "",
+        "- `scaffold` is locked until: plan accepted (`naming_issues=[]`, `missing_deps=[]`)",
+        "- `implement` is locked until: all planned files scaffolded",
+        "- `validate` is locked until: no file contains `raise NotImplementedError`",
+        "- `finalize` is locked until: all files validated",
+        "- `rename_file` is locked after: `finalize_file_names` has run",
+        "",
+        "## Forbidden Operations",
+        "",
+        "- Never pass line numbers to any tool",
+        "- Never create a file not in the plan without amending the plan first",
+        "- Never write to `tests/` files directly - only `scaffold_module` with `with_tests=True`",
+        "- Never skip validate step even if obviously correct",
+        "- Never call `finalize_file_names` more than once",
+        "",
+        "## Quality Gates",
+        "",
+    ])
+    for name in sorted(whitelist):
+        role = "entry-point" if inbound.get(name, 0) == 0 and outbound.get(name, 0) > 0 else "leaf" if outbound.get(name, 0) == 0 else "middle"
+        lines.append(f"- `{name}` ({role}) -> {', '.join(quality_checks.get(name, ['lint']))}")
+    lines.extend([
+        "",
+        "## Plan Notes",
+        "",
+    ])
+    if dependency_cycles:
+        for cycle in dependency_cycles:
+            lines.append(f"- Cycle: {' -> '.join(cycle)}")
+    else:
+        lines.append("- No dependency cycles detected.")
+    if naming_issues:
+        lines.append(f"- Naming issues outstanding: {len(naming_issues)}")
+    if missing_deps:
+        lines.append(f"- Missing dependencies outstanding: {len(missing_deps)}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _write_constraints_document(workspace_root: Path, module_plan: dict[str, Any]) -> Path:
+    constraints_path = workspace_root / _CONSTRAINTS_FILE
+    constraints_path.write_text(_render_constraints_document(module_plan, workspace_root), encoding="utf-8")
+    return constraints_path
 
 
 def _module_plan_ignored_paths(workspace: Any, module_plan: dict[str, Any]) -> set[Path]:
@@ -617,6 +881,18 @@ def _induced_dependency_subgraph(graph: dict[str, Any], target_module: str, incl
     }
 
 
+_REMINDER_INTERVAL = 15
+_PROTOCOL_REMINDER = (
+    "[mini_coding_mcp] PROTOCOL REMINDER: Use this server for ALL Python file work. "
+    "Write order: replace_symbol > add_method > insert_code. "
+    "Read order: workspace_index > get_symbol(summary) > get_symbol(code). "
+    "Imports: add_import only — never hand-edit import blocks. "
+    "New file: plan_module_structure → scaffold_module → replace_symbol → validate → finalize_file_names. "
+    "Read `.mcp_constraints.md` first; it is the active plan whitelist and file-specific gate sheet. "
+    "Never edit .py files directly. Never write .md files manually — call generate_description instead."
+)
+
+
 def create_app(root: Path | None = None) -> FastMCP:
     from .workspace import MiniWorkspace
     import os
@@ -637,6 +913,7 @@ def create_app(root: Path | None = None) -> FastMCP:
     tracker = WorkflowTracker.from_plan(module_plan)
     last_workflow_snapshot: dict[str, Any] | None = None
     last_workflow_next_tool: str | None = None
+    _tool_call_count: int = 0
 
     # Restore focus directory from plan if previously set.
     _focus_rel: str | None = module_plan.get("_focus")
@@ -666,28 +943,104 @@ def create_app(root: Path | None = None) -> FastMCP:
     def _persist_module_plan() -> None:
         _save_module_plan(workspace.root, module_plan)
 
+    def _maybe_remind(result: dict[str, Any]) -> dict[str, Any]:
+        nonlocal _tool_call_count
+        _tool_call_count += 1
+        if _tool_call_count % _REMINDER_INTERVAL == 0:
+            result["_reminder"] = _PROTOCOL_REMINDER
+        return result
+
     def _with_workflow(result: dict[str, Any]) -> dict[str, Any]:
         nonlocal last_workflow_snapshot, last_workflow_next_tool
         workflow = tracker.snapshot()
         next_tool = result.get("next_suggested_tool")
-        if next_tool is None:
-            next_tool = workflow.get("next_tool")
-        if workflow == last_workflow_snapshot and next_tool == last_workflow_next_tool:
-            result["workflow"] = None
-            if next_tool == last_workflow_next_tool:
+        if isinstance(next_tool, dict):
+            next_tool_name = next_tool.get("tool")
+        else:
+            next_tool_name = next_tool
+        if next_tool_name is None:
+            next_tool_name = workflow.get("next_tool")
+        if workflow == last_workflow_snapshot and next_tool_name == last_workflow_next_tool:
+            result.pop("workflow", None)
+            if next_tool_name == last_workflow_next_tool:
                 result.pop("next_suggested_tool", None)
-            return result
+            return _maybe_remind(result)
         result["workflow"] = workflow
         if "next_suggested_tool" not in result and workflow.get("next_tool") is not None:
-            result["next_suggested_tool"] = workflow.get("next_tool")
+            result["next_suggested_tool"] = {
+                "tool": workflow.get("next_tool"),
+                "reason": "workflow_next_step",
+            }
         last_workflow_snapshot = workflow
-        last_workflow_next_tool = result.get("next_suggested_tool")
+        stored_next_tool = result.get("next_suggested_tool")
+        if isinstance(stored_next_tool, dict):
+            last_workflow_next_tool = stored_next_tool.get("tool")
+        else:
+            last_workflow_next_tool = stored_next_tool
+        return _maybe_remind(result)
+
+    def _suggest(result: dict[str, Any], next_tool: str | None, reason: str | None = None) -> dict[str, Any]:
+        if next_tool is not None:
+            result["next_suggested_tool"] = {
+                "tool": next_tool,
+                "reason": reason or "workflow_hint",
+            }
         return result
 
-    def _suggest(result: dict[str, Any], next_tool: str | None) -> dict[str, Any]:
-        if next_tool is not None:
-            result["next_suggested_tool"] = next_tool
+    def _surface_compile_error(result: dict[str, Any]) -> dict[str, Any]:
+        compile_check = result.get("compile_check")
+        if isinstance(compile_check, dict) and compile_check.get("ok") is False and not result.get("error"):
+            error = compile_check.get("error")
+            if isinstance(error, str) and error:
+                result["error"] = error
+                result["error_detail"] = {
+                    "code": "compile_error",
+                    "message": error,
+                    "detail": compile_check,
+                }
         return result
+
+    def _find_dependency_cycles(plan: dict[str, dict[str, Any]]) -> list[list[str]]:
+        adjacency = {
+            name: [dep for dep in info.get("depends_on", []) if dep in plan]
+            for name, info in plan.items()
+            if not name.startswith("_")
+        }
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = []
+        cycles: list[list[str]] = []
+        seen_cycles: set[tuple[str, ...]] = set()
+
+        def _canonical_cycle(cycle: list[str]) -> tuple[str, ...]:
+            ring = cycle[:-1]
+            if not ring:
+                return tuple(cycle)
+            rotations = [tuple(ring[index:] + ring[:index] + [ring[index]]) for index in range(len(ring))]
+            return min(rotations)
+
+        def _dfs(node: str) -> None:
+            visiting.add(node)
+            stack.append(node)
+            for dep in adjacency.get(node, []):
+                if dep in visiting:
+                    start = stack.index(dep)
+                    cycle = stack[start:] + [dep]
+                    key = _canonical_cycle(cycle)
+                    if key not in seen_cycles:
+                        seen_cycles.add(key)
+                        cycles.append(cycle)
+                    continue
+                if dep not in visited:
+                    _dfs(dep)
+            stack.pop()
+            visiting.remove(node)
+            visited.add(node)
+
+        for name in adjacency:
+            if name not in visited:
+                _dfs(name)
+        return cycles
 
     def _apply_code_working_set(result: dict[str, Any], refetch_label: str) -> dict[str, Any]:
         def _apply_payload(payload: dict[str, Any], qname: str, field: str) -> dict[str, Any]:
@@ -704,6 +1057,8 @@ def create_app(root: Path | None = None) -> FastMCP:
             if note:
                 updated = dict(payload)
                 updated["note"] = note
+                if mode == "updated":
+                    updated["content_changed"] = True
                 return updated
             return payload
 
@@ -788,7 +1143,9 @@ def create_app(root: Path | None = None) -> FastMCP:
 
     def _ro(result: dict[str, Any]) -> dict[str, Any]:
         """Return result with no workflow metadata — used by all read-only tools."""
-        return result
+        result.pop("workflow", None)
+        result.pop("next_suggested_tool", None)
+        return _maybe_remind(result)
 
     app = FastMCP(
         name="mini-coding-mcp",
@@ -798,6 +1155,8 @@ def create_app(root: Path | None = None) -> FastMCP:
             "Use this server to insert code into destination files. "
             "Prefer the provided insert tools instead of editing files directly. "
             "Prefer stable symbol IDs like pkg.mod:Class.method. The default write response omits line numbers. "
+            "Read `.mcp_constraints.md` before starting each step; it is generated from the active plan and "
+            "contains the explicit import whitelist, placement rules, symbol inventory, and file-specific quality gates. "
             "STEP -1 — INIT: call init_project first to create pyproject.toml, requirements.txt, tests/conftest.py, "
             ".gitignore, and a src package before planning modules. "
             "STEP 0 — PLAN: before creating any file, call plan_module_structure with every file you intend to "
@@ -821,8 +1180,9 @@ def create_app(root: Path | None = None) -> FastMCP:
             "QUALITY: use lint_file(path) for file-level validation, lint(qname) for symbol-level validation, "
             "type_check(qname) for targeted post-edit diagnostics, and check_plan_complete before "
             "finalize_file_names to ensure no scaffold stubs remain in either the module code or generated tests. "
-            "Use apply_patch(patch_text) to apply a unified diff and rescan the workspace when patch-based edits "
-            "are more convenient than symbol-level updates. "
+            "Use apply_patch(patch_text) ONLY for small targeted unified-diff hunks (under 30 changed lines). "
+            "Never feed apply_patch the full file content — that is rejected. "
+            "For any function or class change use replace_symbol (full body) or patch_symbol (sub-range). "
             "NEVER CREATE .MD FILES MANUALLY: never write README, description, or documentation files by hand. "
             "Call generate_description to produce description.md from the live AST — it includes module docstrings, "
             "signatures, and the full call graph automatically."
@@ -853,6 +1213,7 @@ def create_app(root: Path | None = None) -> FastMCP:
                 result["ok"] = bool(result.get("ok", True)) and bool(result["compile_check"].get("ok", True))
                 tracker.on_edit(final_path, workspace.root)
                 _persist_module_plan()
+        result = _surface_compile_error(result)
         next_tool = "lint_file" if result.get("ok", True) else "patch_symbol"
         return _with_workflow(_suggest(result, next_tool))
 
@@ -1005,6 +1366,11 @@ def create_app(root: Path | None = None) -> FastMCP:
             return {
                 "ok": False,
                 "reason": "not_in_plan",
+                "error_detail": {
+                    "code": "not_in_plan",
+                    "message": f"{file_name} is not registered in the module plan.",
+                    "detail": {"file": file_name},
+                },
                 "hint": f"Call plan_module_structure first with '{file_name}' and a purpose before scaffolding.",
             }
 
@@ -1017,16 +1383,34 @@ def create_app(root: Path | None = None) -> FastMCP:
             header = f"/** {purpose}{imports_note} */\n"
         else:
             header = f'"""{purpose}{imports_note}"""\n'
-        r = workspace.insert_code(destination_file, header)
+        r = workspace.insert_code(destination_file, header, skip_diagnostics=True)
         if not r.get("ok"):
-            return {"ok": False, "reason": "header_write_failed", "detail": r}
+            return {
+                "ok": False,
+                "reason": "header_write_failed",
+                "detail": r,
+                "error_detail": {
+                    "code": "header_write_failed",
+                    "message": "Failed to write module header during scaffolding.",
+                    "detail": r,
+                },
+            }
 
         if language_key == "python":
             type_imports = _scaffold_typing_imports(stubs)
             if type_imports:
                 import_result = workspace.add_import("typing", names=type_imports, path=destination_file)
                 if not import_result.get("accepted", import_result.get("ok", False)):
-                    return {"ok": False, "reason": "type_import_write_failed", "detail": import_result}
+                    return {
+                        "ok": False,
+                        "reason": "type_import_write_failed",
+                        "detail": import_result,
+                        "error_detail": {
+                            "code": "type_import_write_failed",
+                            "message": "Failed to insert typing imports for scaffolded stubs.",
+                            "detail": import_result,
+                        },
+                    }
 
         for stub in stubs:
             kind = stub.get("kind", "function")
@@ -1078,14 +1462,29 @@ def create_app(root: Path | None = None) -> FastMCP:
                         f"}}\n"
                     )
 
-            r = workspace.insert_code(destination_file, code)
+            r = workspace.insert_code(destination_file, code, skip_diagnostics=True)
             all_edited.extend(r.get("edited", []))
             ok = r.get("ok", False)
-            qname = r.get("edited", [None])[0]
+            qname = (r.get("edited") or [None])[0]
             scaffolded.append({"name": name, "qname": qname, "ok": ok})
             if not ok:
                 failed.append(name)
 
+        if file_name in module_plan:
+            module_plan[file_name]["symbols"] = [
+                {
+                    "name": str(stub.get("name", "")).strip(),
+                    "kind": str(stub.get("kind", "function")).strip(),
+                    "args": str(stub.get("args", "")).strip(),
+                    "returns": str(stub.get("returns", "")).strip(),
+                    "docstring": str(stub.get("docstring", "")).strip(),
+                }
+                for stub in stubs
+                if str(stub.get("name", "")).strip()
+            ]
+
+        # Run ruff once for all stubs instead of once per stub.
+        workspace.diagnostic_store.refresh([initial_path.resolve()])
         working_set.evict_many(all_edited)
         final_path, suffix_info = _sync_numeric_suffix(workspace, module_plan, initial_path)
         if final_path.name != initial_path.name:
@@ -1116,20 +1515,23 @@ def create_app(root: Path | None = None) -> FastMCP:
 
         tracker.on_scaffold(final_path.name)
         _persist_module_plan()
+        _write_constraints_document(workspace.root, module_plan)
         payload = {
             "ok": len(failed) == 0,
             "destination_file": str(final_path),
             "scaffolded": [s for s in scaffolded if s["ok"]],
             "failed": failed,
             "edited": all_edited,
-            "suffix": suffix_info or {"value": 0, "modules": [], "calls": []},
         }
+        if suffix_info and suffix_info.get("value", 0):
+            payload["suffix"] = suffix_info
         if test_file is not None:
             payload["test_file"] = str(test_file)
         if test_result is not None:
             payload["test_result"] = test_result
             payload["ok"] = bool(payload["ok"]) and bool(test_result.get("ok", False))
-        return _with_workflow(_suggest(payload, "insert_code"))
+        next_tool = "replace_symbol" if payload["ok"] else "patch_symbol"
+        return _with_workflow(_suggest(payload, next_tool, "scaffold_complete"))
 
     @app.tool(
         description=(
@@ -1179,7 +1581,17 @@ def create_app(root: Path | None = None) -> FastMCP:
             result = workspace.get_symbol_calls(name=qname, path=path, qualname=qname, verbose=verbose)
             return _ro(_apply_function_result_working_set(result, qname, "get_symbol(..., detail='calls')"))
         if detail != "code":
-            return _ro({"found": False, "reason": "invalid_detail", "detail": detail})
+            return _ro({
+                "ok": False,
+                "reason": "invalid_detail_value",
+                "detail": detail,
+                "valid_values": ["summary", "code", "calls", "position", "children"],
+                "error_detail": {
+                    "code": "invalid_detail_value",
+                    "message": f"Unsupported detail value: {detail}",
+                    "detail": {"valid_values": ["summary", "code", "calls", "position", "children"]},
+                },
+            })
 
         result = workspace.get_symbol(qname=qname, path=path, kind=kind, projection="code")
         if result.get("found") and not force_show:
@@ -1313,7 +1725,7 @@ def create_app(root: Path | None = None) -> FastMCP:
         for dep in result.get("dependencies", []):
             if isinstance(dep, dict) and isinstance(dep.get("definition"), dict):
                 dep["definition"] = _apply_code_working_set(dep["definition"], "get_symbol_with_deps(..., dependency)")
-        return _with_workflow(result)
+        return _with_workflow(_suggest(result, "lint_file"))
 
     @app.tool(
         description=(
@@ -1368,8 +1780,13 @@ def create_app(root: Path | None = None) -> FastMCP:
             "Find functions, methods, and classes defined in the scoped workspace files that are never called anywhere."
         )
     )
-    def dead_symbols(files: list[str] | None = None, roots: list[str] | None = None) -> dict[str, Any]:
-        result = workspace.dead_symbols(files=files, roots=roots)
+    def dead_symbols(
+        files: list[str] | None = None,
+        roots: list[str] | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        result = workspace.dead_symbols(files=files, roots=roots, limit=limit, offset=offset)
         if files:
             tracker.on_quality_check([Path(f).name for f in files])
             _persist_module_plan()
@@ -1518,6 +1935,7 @@ def create_app(root: Path | None = None) -> FastMCP:
                 }
             if isinstance(result.get("compile_check"), dict):
                 result["ok"] = bool(result.get("ok", True)) and bool(result["compile_check"].get("ok", True))
+        result = _surface_compile_error(result)
         return _with_workflow(_suggest(result, "lint_file"))
 
     @app.tool(
@@ -1566,11 +1984,15 @@ def create_app(root: Path | None = None) -> FastMCP:
                         "path": destination,
                         "error": "path_resolution_failed",
                     }
-        return _with_workflow(result)
+        result = _surface_compile_error(result)
+        return _with_workflow(_suggest(result, "lint_file"))
 
     @app.tool(
         description=(
-            "Apply a unified diff via native patch or Python fallback, then rescan the workspace."
+            "Apply a unified diff via native patch or Python fallback, then rescan the workspace. "
+            "ONLY use this for small targeted hunks (typically under 30 changed lines). "
+            "Do NOT use *** Update File: to rewrite an entire file — that is rejected. "
+            "For symbol-level changes always prefer replace_symbol (full body) or patch_symbol (sub-range)."
         )
     )
     def apply_patch(patch_text: str) -> dict[str, Any]:
@@ -1597,6 +2019,7 @@ def create_app(root: Path | None = None) -> FastMCP:
                     result["ok"] = bool(result.get("ok", True)) and bool(result["compile_check"].get("ok", True))
                 except ValueError:
                     pass
+        result = _surface_compile_error(result)
         return _with_workflow(_suggest(result, "lint_file"))
 
     @app.tool(description="Rename a symbol across the workspace in a best-effort way.")
@@ -1628,19 +2051,18 @@ def create_app(root: Path | None = None) -> FastMCP:
             "run_script", "main_script", "run_training", "train_script",
             "my_module", "new_module", "helper_module", "utils_module",
         }
-        metadata = {key: value for key, value in module_plan.items() if key.startswith("_")}
-        module_plan.clear()
-        for key, value in metadata.items():
-            if key == "_ignored":
-                module_plan[key] = set(value) if isinstance(value, (set, list, tuple)) else set()
-            else:
-                module_plan[key] = value
+        existing_plan_entries = {
+            key: value for key, value in module_plan.items()
+            if isinstance(key, str) and not key.startswith("_") and isinstance(value, dict)
+        }
         for entry in files:
             name = entry.get("name", "").strip()
             if name:
+                current = existing_plan_entries.get(name, {})
                 module_plan[name] = {
                     "purpose": entry.get("purpose", ""),
                     "depends_on": entry.get("depends_on", []),
+                    **{k: v for k, v in current.items() if k not in {"purpose", "depends_on"}},
                 }
 
         naming_issues: list[dict] = []
@@ -1659,25 +2081,41 @@ def create_app(root: Path | None = None) -> FastMCP:
                 if dep not in module_plan:
                     missing_deps.append({"file": name, "missing": dep})
 
-        dependency_graph = [
-            {"file": name, "purpose": info["purpose"], "imports_from": info["depends_on"]}
-            for name, info in module_plan.items()
-            if not name.startswith("_")
+        dependency_cycles = [
+            {"cycle": cycle, "hint": "Remove the circular import chain from depends_on before scaffolding."}
+            for cycle in _find_dependency_cycles(module_plan)
         ]
-        ok = not naming_issues and not missing_deps
-        tracker.on_plan(_module_plan_file_names(module_plan), ok)
-        _persist_module_plan()
-        return _with_workflow(_suggest({
+        ok = not naming_issues and not missing_deps and not dependency_cycles
+        module_plan["_plan_validation"] = {
             "ok": ok,
             "naming_issues": naming_issues,
             "missing_deps": missing_deps,
-            "dependency_graph": dependency_graph,
+            "dependency_cycles": dependency_cycles,
+        }
+        tracker.on_plan(_module_plan_file_names(module_plan), ok)
+        _persist_module_plan()
+        payload = {
+            "ok": ok,
+            "naming_issues": naming_issues,
+            "missing_deps": missing_deps,
+            "dependency_cycles": dependency_cycles,
             "hint": (
                 "Fix naming_issues before creating any file."
                 if naming_issues else
+                "Remove circular depends_on entries before creating any file."
+                if dependency_cycles else
                 "Plan accepted. Call scaffold_module for each file next."
             ),
-        }, "scaffold_module"))
+        }
+        if ok:
+            payload["dependency_graph"] = [
+                {"file": name, "purpose": info["purpose"], "imports_from": info["depends_on"]}
+                for name, info in module_plan.items()
+                if not name.startswith("_")
+            ]
+        constraints_path = _write_constraints_document(workspace.root, module_plan)
+        payload["constraints_file"] = str(constraints_path)
+        return _with_workflow(_suggest(payload, "scaffold_module"))
 
     @app.tool(
         description=(
@@ -2172,9 +2610,18 @@ def create_app(root: Path | None = None) -> FastMCP:
             "Use this as an internal splitting signal."
         )
     )
-    def analyze_static_code(files: list[str] | None = None, roots: list[str] | None = None) -> dict[str, Any]:
+    def analyze_static_code(
+        files: list[str] | None = None,
+        roots: list[str] | None = None,
+        include_unused_imports: bool = False,
+    ) -> dict[str, Any]:
         target_files = _workspace_python_files(workspace, module_plan, files=files, roots=roots)
         result = analyze_workspace(workspace.root, files=target_files)
+        if not include_unused_imports:
+            result = dict(result)
+            result["summary"] = dict(result.get("summary", {}))
+            result["summary"].pop("unused_imports", None)
+            result.pop("unused_imports", None)
         if files:
             tracker.on_quality_check([Path(f).name for f in files])
             _persist_module_plan()
@@ -2372,6 +2819,40 @@ def create_app(root: Path | None = None) -> FastMCP:
                 "orphans": sum(1 for item in file_meta_items if item["orphan"]),
             },
         })
+
+    @app.tool(
+        description=(
+            "Hot-reload one or all of the MCP server's internal sub-modules without restarting. "
+            "Pass module_name as the short sub-module name (e.g. 'call_graph', 'file_suffix', "
+            "'lang.router', 'static_analysis', 'stable_index', 'working_set', 'workflow_tracker', "
+            "'tools.regex_rules') to reload a single module, or omit it to reload all managed "
+            "sub-modules. After reload the server re-binds all module-level symbols automatically."
+        )
+    )
+    def reload_modules(module_name: str | None = None) -> dict[str, Any]:
+        reloaded: list[str] = []
+        failed: list[dict[str, Any]] = []
+        targets = (
+            [f"{_PKG}.{module_name}"]
+            if module_name
+            else list(_reloader.get_loaded_modules())
+        )
+        for full_name in targets:
+            if full_name not in _reloader.get_loaded_modules():
+                failed.append({"module": full_name, "error": "not_registered"})
+                continue
+            try:
+                _reloader.reload_module(full_name)
+                reloaded.append(full_name)
+            except Exception as exc:
+                failed.append({"module": full_name, "error": str(exc)})
+        _bind_module_symbols()
+        return {
+            "ok": len(failed) == 0,
+            "reloaded": reloaded,
+            "failed": failed,
+            "managed_modules": _reloader.get_loaded_modules(),
+        }
 
     return app
 
