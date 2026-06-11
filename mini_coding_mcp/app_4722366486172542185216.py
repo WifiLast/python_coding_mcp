@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast as _ast
+import functools
 import json
 import os
 import py_compile
@@ -915,6 +916,7 @@ def create_app(root: Path | None = None) -> FastMCP:
     last_workflow_snapshot: dict[str, Any] | None = None
     last_workflow_next_tool: str | None = None
     _tool_call_count: int = 0
+    workspace_root_set = False
     clear_call_graph_cache()
 
     def _active_focus() -> Path | None:
@@ -974,6 +976,23 @@ def create_app(root: Path | None = None) -> FastMCP:
                 "reason": reason or "workflow_hint",
             }
         return result
+
+    def _workspace_root_error(tool_name: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "accepted": False,
+            "reason": "workspace_root_not_initialized",
+            "error": "Call set_workspace_root(path) first.",
+            "error_detail": {
+                "code": "workspace_root_not_initialized",
+                "message": "Workspace root must be explicitly initialized before using this tool.",
+                "detail": {
+                    "tool": tool_name,
+                    "allowed_tools": ["get_workspace_root", "set_workspace_root"],
+                },
+            },
+            "hint": "Call set_workspace_root(path) and confirm it with get_workspace_root() before using other tools.",
+        }
 
     def _surface_compile_error(result: dict[str, Any]) -> dict[str, Any]:
         compile_check = result.get("compile_check")
@@ -1138,8 +1157,10 @@ def create_app(root: Path | None = None) -> FastMCP:
     app = FastMCP(
         name="mini-coding-mcp",
         instructions=(
-            "WORKSPACE ROOT: Call set_workspace_root(path) to work with a different project directory. "
-            "The server starts with the current working directory. Use get_workspace_root() to check the current workspace. "
+            "WORKSPACE ROOT: Before using any tool except get_workspace_root and set_workspace_root, call "
+            "set_workspace_root(path) to explicitly initialize the workspace root, then confirm it with "
+            "get_workspace_root(). The server starts with the current working directory, but tools remain disabled "
+            "until initialization succeeds. Use get_workspace_root() to check the current workspace. "
             "Use this server to insert code into destination files. "
             "Prefer the provided insert tools instead of editing files directly. "
             "Prefer stable symbol IDs like pkg.mod:Class.method. The default write response omits line numbers. "
@@ -1176,6 +1197,27 @@ def create_app(root: Path | None = None) -> FastMCP:
             "signatures, and the full call graph automatically."
         ),
     )
+
+    _original_tool = app.tool
+
+    def _guarded_tool(*tool_args: Any, **tool_kwargs: Any) -> Any:
+        decorator = _original_tool(*tool_args, **tool_kwargs)
+
+        def _register(func: Any) -> Any:
+            if func.__name__ in {"set_workspace_root", "get_workspace_root"}:
+                return decorator(func)
+
+            @functools.wraps(func)
+            def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                if not workspace_root_set:
+                    return _workspace_root_error(func.__name__)
+                return func(*args, **kwargs)
+
+            return decorator(_wrapped)
+
+        return _register
+
+    app.tool = _guarded_tool  # type: ignore[assignment]
 
     @app.tool(
         description=(
@@ -1264,7 +1306,7 @@ def create_app(root: Path | None = None) -> FastMCP:
         )
     )
     def set_workspace_root(path: str) -> dict[str, Any]:
-        nonlocal workspace, module_plan, tracker, last_workflow_snapshot, last_workflow_next_tool
+        nonlocal workspace, module_plan, tracker, last_workflow_snapshot, last_workflow_next_tool, workspace_root_set
         previous_root = workspace.root  # Save the previous root before changing
         try:
             new_root = Path(path).resolve()
@@ -1290,6 +1332,7 @@ def create_app(root: Path | None = None) -> FastMCP:
             workspace.symbol_index.ensure_scanned()
 
             source_files = [str(p.relative_to(new_root)) for p in workspace._iter_workspace_source_files()]
+            workspace_root_set = True
             return {
                 "ok": True,
                 "previous_root": str(previous_root),
@@ -1316,6 +1359,7 @@ def create_app(root: Path | None = None) -> FastMCP:
         return {
             "ok": True,
             "root": str(workspace.root),
+            "workspace_root_set": workspace_root_set,
             "exists": workspace.root.exists(),
             "is_dir": workspace.root.is_dir(),
             "source_files_count": len(source_files),
@@ -2679,7 +2723,7 @@ def create_app(root: Path | None = None) -> FastMCP:
                 if detail.kind not in ("function", "method", "class"):
                     continue
                 qname = _qname(workspace.root, path, detail.qualname)
-                summary = workspace._extract_symbol_summary(detail, source)
+                _summary = workspace._extract_symbol_summary(detail, source)
                 doc = (detail.docstring or "").strip() or "*(no docstring)*"
                 calls = calls_map.get(qname, [])
                 called_by = callers_map.get(qname, [])

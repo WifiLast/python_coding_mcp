@@ -55,7 +55,7 @@ from .manipulator import (
 )
 
 # Import app entry points from .app to preserve backwards compatibility.
-from .app import create_app, main  # noqa: F401
+from .app_4722366486172542185216 import create_app, main  # noqa: F401
 
 __all__ = ["MiniWorkspace", "create_app", "main"]
 
@@ -154,6 +154,212 @@ class MiniWorkspace:
     def _write_text(self, path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
+
+    def _write_text_atomic(self, path: Path, text: str) -> None:
+        """Write text atomically to avoid partially applied edits."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+
+    def _preserve_text_style(self, original_text: str | None, new_text: str) -> str:
+        """Keep the original newline style and trailing-newline state when possible."""
+        if original_text is None:
+            return new_text
+        uses_crlf = "\r\n" in original_text
+        had_trailing_newline = original_text.endswith(("\n", "\r"))
+        normalized = new_text.replace("\r\n", "\n").replace("\r", "\n")
+        if uses_crlf:
+            normalized = normalized.replace("\n", "\r\n")
+            if had_trailing_newline and not normalized.endswith("\r\n"):
+                normalized += "\r\n"
+            elif not had_trailing_newline and normalized.endswith("\r\n"):
+                normalized = normalized[:-2]
+        else:
+            if had_trailing_newline and not normalized.endswith("\n"):
+                normalized += "\n"
+            elif not had_trailing_newline and normalized.endswith("\n"):
+                normalized = normalized[:-1]
+        return normalized
+
+    def _find_subsequence(
+        self,
+        haystack: list[str],
+        needle: list[str],
+        start: int = 0,
+        end: int | None = None,
+        tolerant: bool = False,
+    ) -> tuple[int | None, bool]:
+        """Find a unique subsequence match, optionally ignoring trailing whitespace."""
+        if not needle:
+            return max(start, 0), False
+        limit = len(haystack) - len(needle) + 1
+        if limit < 0:
+            return None, False
+        begin = max(start, 0)
+        stop = limit if end is None else min(max(end, 0), limit)
+        needle_cmp = [line.rstrip() for line in needle] if tolerant else needle
+        matches: list[int] = []
+        for index in range(begin, stop):
+            segment = haystack[index : index + len(needle)]
+            if segment == needle or (tolerant and [line.rstrip() for line in segment] == needle_cmp):
+                matches.append(index)
+                if len(matches) > 1:
+                    return None, True
+        if len(matches) == 1:
+            return matches[0], False
+        return None, False
+
+    def _locate_patch_target(
+        self,
+        haystack: list[str],
+        needle: list[str],
+        hint: int,
+    ) -> tuple[int | None, str | None]:
+        """Locate a hunk target near a hint, then across the file, with whitespace fallback."""
+        window = max(len(needle) + 8, 16)
+        window_start = max(hint - window, 0)
+        window_end = min(hint + window + 1, len(haystack) - len(needle) + 1 if needle else len(haystack) + 1)
+        for tolerant in (False, True):
+            match, ambiguous = self._find_subsequence(haystack, needle, start=window_start, end=window_end, tolerant=tolerant)
+            if ambiguous:
+                return None, "ambiguous_match"
+            if match is not None:
+                return match, None
+            match, ambiguous = self._find_subsequence(haystack, needle, start=0, end=None, tolerant=tolerant)
+            if ambiguous:
+                return None, "ambiguous_match"
+            if match is not None:
+                return match, None
+        return None, "context_mismatch"
+
+    def _validate_patch_text(self, path: Path, original_text: str | None, new_text: str) -> tuple[bool, str | None]:
+        """Validate the proposed file contents before writing them to disk."""
+        original_ok = False
+        if original_text is not None:
+            if path.suffix.lower() == ".py":
+                original_ok = self._parse_python(original_text) is not None
+            else:
+                adapter = adapter_for(path)
+                if adapter is not None:
+                    try:
+                        original_ok = adapter.parse(original_text) is not None
+                    except Exception:
+                        original_ok = False
+        new_ok = True
+        if path.suffix.lower() == ".py":
+            new_ok = self._parse_python(new_text) is not None
+        else:
+            adapter = adapter_for(path)
+            if adapter is not None:
+                try:
+                    new_ok = adapter.parse(new_text) is not None
+                except Exception:
+                    new_ok = False
+        if original_ok and not new_ok:
+            return False, f"syntax validation failed for {path.name}"
+
+        original_lines = original_text.splitlines() if original_text is not None else []
+        new_lines = new_text.splitlines()
+        if original_lines and len(new_lines) > 20 and len(new_lines) >= int(len(original_lines) * 0.8):
+            return False, (
+                f"apply_patch rejected for {path.name}: proposed edit looks like a near-full rewrite. "
+                "Use replace_symbol or patch_symbol for larger code changes."
+            )
+        return True, None
+
+    def _commit_patch_transaction(
+        self,
+        originals: dict[Path, str | None],
+        proposed: dict[Path, str | None],
+        changed_files: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        """Validate, atomically write, and reindex a staged patch."""
+        ordered_paths = changed_files or list(proposed.keys())
+        if not ordered_paths:
+            return {"accepted": False, "reason": "patch_no_changes", "stderr": "no staged changes"}
+
+        prepared: dict[Path, str | None] = {}
+        for path in ordered_paths:
+            original_text = originals.get(path)
+            if original_text is None and path.exists() and path not in originals:
+                original_text = self._read_text(path)
+            new_text = proposed.get(path)
+            if new_text is None:
+                prepared[path] = None
+                continue
+            adjusted = self._preserve_text_style(original_text, new_text)
+            ok, error = self._validate_patch_text(path, original_text, adjusted)
+            if not ok:
+                return {"accepted": False, "reason": "patch_validation_failed", "stderr": error}
+            prepared[path] = adjusted
+
+        backup_dir = self.root / ".mcp_backups"
+        written: list[Path] = []
+        try:
+            for path in ordered_paths:
+                original_text = originals.get(path)
+                if original_text is None and path.exists() and path not in originals:
+                    original_text = self._read_text(path)
+                if original_text is not None:
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    backup_fd, backup_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".bak", dir=str(backup_dir))
+                    os.close(backup_fd)
+                    backup_path = Path(backup_name)
+                    self._write_text_atomic(backup_path, original_text)
+
+                new_text = prepared.get(path)
+                if new_text is None:
+                    if path.exists():
+                        path.unlink()
+                else:
+                    self._write_text_atomic(path, new_text)
+                written.append(path)
+        except Exception as exc:
+            for path in reversed(written):
+                original_text = originals.get(path)
+                if original_text is None and path.exists() and path not in originals:
+                    original_text = self._read_text(path) if path.exists() else None
+                try:
+                    if original_text is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        self._write_text_atomic(path, original_text)
+                except OSError:
+                    pass
+            return {"accepted": False, "reason": "patch_commit_failed", "stderr": str(exc)}
+
+        self._workspace_index_cache = None
+        self._file_index_cache.clear()
+        touched = [path for path in ordered_paths if prepared.get(path) is not None and path.exists()]
+        removed = [path for path in ordered_paths if prepared.get(path) is None]
+        for path in touched:
+            self.symbol_index.reindex_file(path)
+        for path in removed:
+            resolved = path.resolve()
+            for qname in list(self.symbol_index.by_file.get(resolved, [])):
+                self.symbol_index.symbols.pop(qname, None)
+            self.symbol_index.by_file.pop(resolved, None)
+        self.diagnostic_store.refresh(touched + removed)
+        return {
+            "accepted": True,
+            "returncode": 0,
+            "stdout": f"Applied patch: {len(ordered_paths)} file(s) changed.",
+            "stderr": "",
+            "changed_files": [str(p) for p in ordered_paths],
+        }
 
     def _parse_python(self, source: str) -> ast.Module | None:
         try:
@@ -2726,6 +2932,8 @@ class MiniWorkspace:
 
         lines = patch_text.splitlines(keepends=True)
         i = 0
+        proposed: dict[Path, str | None] = {}
+        originals: dict[Path, str | None] = {}
         changed_files: list[Path] = []
 
         while i < len(lines):
@@ -2753,15 +2961,23 @@ class MiniWorkspace:
             else:
                 return {"accepted": False, "returncode": -1, "stdout": "", "stderr": f"cannot resolve path: {new_path_str}"}
 
-            file_lines = self._read_text(path).splitlines(keepends=True)
+            original_text = self._read_text(path)
+            file_lines = original_text.splitlines(keepends=True)
+            originals[path] = original_text
+            current_lines = list(file_lines)
             offset = 0
+            hunk_seen = False
 
             while i < len(lines) and lines[i].startswith("@@"):
-                m = _re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
-                if not m:
-                    i += 1
-                    continue
-                old_start = int(m.group(1))
+                header = lines[i].strip()
+                if header == "@@":
+                    old_start = 1
+                else:
+                    m = _re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
+                    if not m:
+                        i += 1
+                        continue
+                    old_start = int(m.group(1))
                 i += 1
 
                 hunk_old: list[str] = []
@@ -2788,20 +3004,22 @@ class MiniWorkspace:
                     i += 1
 
                 start_idx = old_start - 1 + offset
-                file_lines[start_idx : start_idx + len(hunk_old)] = hunk_new
+                match_idx, reason = self._locate_patch_target(current_lines, hunk_old, start_idx)
+                if match_idx is None:
+                    stderr = "ambiguous hunk match" if reason == "ambiguous_match" else "context mismatch while patching"
+                    return {"accepted": False, "returncode": -1, "stdout": "", "stderr": f"{stderr}: {path.name}"}
+                current_lines[match_idx : match_idx + len(hunk_old)] = hunk_new
                 offset += len(hunk_new) - len(hunk_old)
+                hunk_seen = True
 
-            self._write_text(path, "".join(file_lines))
-            changed_files.append(path)
+            if hunk_seen:
+                proposed[path] = "".join(current_lines)
+                changed_files.append(path)
 
         if not changed_files:
             return {"accepted": False, "returncode": -1, "stdout": "", "stderr": "no hunks applied"}
 
-        self._workspace_index_cache = None
-        self._file_index_cache.clear()
-        self.symbol_index.scan()
-        self.diagnostic_store.refresh(list(self.symbol_index.by_file.keys()))
-        return {"accepted": True, "stdout": f"applied to {len(changed_files)} file(s)", "stderr": ""}
+        return self._commit_patch_transaction(originals, proposed, changed_files)
 
     def _native_patch_commands(self, patch_path: Path) -> list[list[str]]:
         """Return ordered list of native commands to try, based on OS and available binaries."""
@@ -2817,12 +3035,30 @@ class MiniWorkspace:
 
     def _apply_begin_patch_format(self, patch_text: str) -> dict[str, Any]:
         """Handle the *** Begin Patch / *** Add File / *** Delete File custom format."""
+        import re as _re
+
+        proposed: dict[Path, str | None] = {}
+        originals: dict[Path, str | None] = {}
         changed_files: list[Path] = []
         errors: list[str] = []
 
+        def _normalize_body_lines(block_lines: list[str]) -> list[str]:
+            normalized: list[str] = []
+            for raw in block_lines:
+                if raw.startswith("+ "):
+                    normalized.append(raw[2:])
+                elif raw.startswith("+"):
+                    normalized.append(raw[1:])
+                elif raw.startswith("  "):
+                    normalized.append(raw[2:])
+                elif raw.startswith(" "):
+                    normalized.append(raw[1:])
+                else:
+                    normalized.append(raw)
+            return normalized
+
         lines = patch_text.splitlines()
         i = 0
-        # skip to first directive
         while i < len(lines) and not lines[i].startswith("*** "):
             i += 1
 
@@ -2830,107 +3066,117 @@ class MiniWorkspace:
         current_path: Path | None = None
         content_lines: list[str] = []
 
-        def _flush() -> None:
-            if current_op in ("Add File", "Update File") and current_path is not None:
-                if current_op == "Update File" and current_path.exists():
-                    original_lines = current_path.read_text(encoding="utf-8").splitlines()
-                    if len(content_lines) > 20 and len(original_lines) > 0 and len(content_lines) >= len(original_lines) * 0.8:
-                        errors.append(
-                            f"apply_patch rejected for {current_path.name}: *** Update File supplies "
-                            f"{len(content_lines)} lines ({len(original_lines)} original) — this is a "
-                            "near-full file rewrite, not a patch. Use replace_symbol to replace a specific "
-                            "function or class, or patch_symbol for a sub-range edit."
-                        )
-                        return
-                current_path.parent.mkdir(parents=True, exist_ok=True)
-                current_path.write_text("\n".join(content_lines) + ("\n" if content_lines else ""), encoding="utf-8")
+        def _stage_current_file() -> None:
+            nonlocal content_lines
+            if current_op is None or current_path is None:
+                return
+            if current_op == "Add File":
+                originals[current_path] = None
+                proposed[current_path] = "\n".join(_normalize_body_lines(content_lines)) + ("\n" if content_lines else "")
                 changed_files.append(current_path)
+            elif current_op == "Update File":
+                original_text = self._read_text(current_path)
+                originals[current_path] = original_text
+                original_lines = original_text.splitlines(keepends=True)
+                if any(line.startswith("@@") for line in content_lines):
+                    current_lines = list(original_lines)
+                    offset = 0
+                    j = 0
+                    while j < len(content_lines):
+                        if not content_lines[j].startswith("@@"):
+                            j += 1
+                            continue
+                        header = content_lines[j].strip()
+                        if header == "@@":
+                            old_start = 1
+                        else:
+                            match = _re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", header)
+                            if not match:
+                                errors.append(f"invalid hunk header in {current_path.name}: {header}")
+                                break
+                            old_start = int(match.group(1))
+                        j += 1
+                        hunk_old: list[str] = []
+                        hunk_new: list[str] = []
+                        while j < len(content_lines):
+                            raw = content_lines[j]
+                            if raw.startswith("@@") or raw.startswith("*** "):
+                                break
+                            if raw.startswith("\\ "):
+                                j += 1
+                                continue
+                            if not raw:
+                                j += 1
+                                continue
+                            prefix, content = raw[0], raw[1:]
+                            if not content.endswith("\n"):
+                                content += "\n"
+                            if prefix == " ":
+                                hunk_old.append(content)
+                                hunk_new.append(content)
+                            elif prefix == "-":
+                                hunk_old.append(content)
+                            elif prefix == "+":
+                                hunk_new.append(content)
+                            else:
+                                errors.append(f"unexpected patch line in {current_path.name}: {raw}")
+                                break
+                            j += 1
+                        hint = old_start - 1 + offset
+                        match_idx, reason = self._locate_patch_target(current_lines, hunk_old, hint)
+                        if match_idx is None:
+                            errors.append(
+                                f"{'ambiguous' if reason == 'ambiguous_match' else 'context mismatch'} while patching {current_path.name}"
+                            )
+                            break
+                        current_lines[match_idx : match_idx + len(hunk_old)] = hunk_new
+                        offset += len(hunk_new) - len(hunk_old)
+                    if errors:
+                        return
+                    proposed[current_path] = "".join(current_lines)
+                    changed_files.append(current_path)
+                else:
+                    proposed[current_path] = "\n".join(_normalize_body_lines(content_lines)) + ("\n" if content_lines else "")
+                    changed_files.append(current_path)
+            content_lines = []
 
         while i < len(lines):
             line = lines[i]
             if line.startswith("*** End Patch"):
-                _flush()
+                _stage_current_file()
                 break
             if line.startswith("*** Delete File:"):
-                _flush()
+                _stage_current_file()
                 rel = line[len("*** Delete File:"):].strip()
                 target = (self.root / rel).resolve()
                 if target.exists():
-                    target.unlink()
+                    originals[target] = self._read_text(target)
+                    proposed[target] = None
                     changed_files.append(target)
                 current_op = None
                 current_path = None
                 content_lines = []
             elif line.startswith("*** Add File:") or line.startswith("*** Update File:"):
-                _flush()
+                _stage_current_file()
                 prefix = "*** Add File:" if line.startswith("*** Add File:") else "*** Update File:"
                 current_op = prefix[4:-1]
                 rel = line[len(prefix):].strip()
                 current_path = (self.root / rel).resolve()
                 content_lines = []
             elif current_op in ("Add File", "Update File"):
-                if line.startswith("+ "):
-                    content_lines.append(line[2:])
-                elif line.startswith("+"):
-                    content_lines.append(line[1:])
-                elif line.startswith("  ") or line.startswith(" "):
-                    content_lines.append(line[1:])
+                content_lines.append(line)
             i += 1
 
         if not changed_files and errors:
             return {"accepted": False, "reason": "begin_patch_errors", "errors": errors}
+        if errors:
+            return {"accepted": False, "reason": "begin_patch_errors", "errors": errors}
         if not changed_files:
             return {"accepted": False, "reason": "begin_patch_no_changes", "patch_format": "begin_patch"}
 
-        self._workspace_index_cache = None
-        self._file_index_cache.clear()
-        for path in changed_files:
-            if path.exists():
-                self.symbol_index.reindex_file(path)
-            else:
-                resolved = path.resolve()
-                for qname in list(self.symbol_index.by_file.get(resolved, [])):
-                    self.symbol_index.symbols.pop(qname, None)
-                self.symbol_index.by_file.pop(resolved, None)
-        self.diagnostic_store.refresh([p for p in changed_files if p.exists()])
-        return {
-            "accepted": True,
-            "returncode": 0,
-            "stdout": f"Applied begin-patch format: {len(changed_files)} file(s) changed.",
-            "stderr": "",
-            "changed_files": [str(p) for p in changed_files],
-        }
+        return self._commit_patch_transaction(originals, proposed, changed_files)
 
     def apply_patch(self, patch_text: str) -> dict[str, Any]:
-        patch_path = self.root / ".mini_coding_mcp.patch"
-        patch_path.write_text(patch_text, encoding="utf-8")
-        patch_succeeded = False
-        stdout = stderr = ""
-        try:
-            for cmd in self._native_patch_commands(patch_path):
-                try:
-                    result = subprocess.run(
-                        cmd, cwd=self.root, capture_output=True, text=True, check=False, timeout=30,
-                    )
-                    if result.returncode == 0:
-                        patch_succeeded = True
-                        stdout, stderr = result.stdout, result.stderr
-                        break
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    continue
-        finally:
-            try:
-                patch_path.unlink()
-            except FileNotFoundError:
-                pass
-
-        if patch_succeeded:
-            self._workspace_index_cache = None
-            self._file_index_cache.clear()
-            self.symbol_index.scan()
-            self.diagnostic_store.refresh(self.symbol_index.by_file.keys())
-            return {"accepted": True, "stdout": stdout, "stderr": stderr}
-
         if patch_text.lstrip().startswith("*** Begin Patch"):
             return self._apply_begin_patch_format(patch_text)
 

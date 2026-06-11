@@ -51,6 +51,11 @@ class FunctionCallCollector(ast.NodeVisitor):
 _CALL_GRAPH_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
+def clear_call_graph_cache() -> None:
+    """Drop all cached call-graph results for every workspace root."""
+    _CALL_GRAPH_CACHE.clear()
+
+
 def _read_source(path: Path) -> str:
     for encoding in ("utf-8", "cp1252", "latin-1"):
         try:
